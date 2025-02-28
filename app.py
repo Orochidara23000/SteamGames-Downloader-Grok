@@ -6,16 +6,47 @@ import re
 import time
 import requests
 from pyngrok import ngrok
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Configuration
-DOWNLOAD_DIR = "./downloads"
-STEAMCMD_PATH = "./steamcmd/steamcmd.sh" if os.name == 'posix' else "./steamcmd/steamcmd.exe"
-LOG_FILE = "steamcmd.log"
+IS_RAILWAY = os.environ.get("RAILWAY_ENVIRONMENT") is not None
+BASE_DIR = os.getcwd()
+STEAMCMD_DIR = os.path.join(BASE_DIR, "steamcmd")
+LOG_FILE = os.path.join(BASE_DIR, "steamcmd.log")
 PORT = int(os.environ.get("PORT", 7860))  # Railway assigns PORT
 PUBLIC_URL = None  # Will be set dynamically
 
+# Adjust download directory for Railway's ephemeral filesystem
+if IS_RAILWAY:
+    # Consider using Railway's volume mount point if configured
+    VOLUME_MOUNT = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if VOLUME_MOUNT:
+        DOWNLOAD_DIR = os.path.join(VOLUME_MOUNT, "downloads")
+    else:
+        DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+    
+    # Set public URL correctly
+    PUBLIC_URL = f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')}"
+else:
+    DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+
+STEAMCMD_PATH = os.path.join(STEAMCMD_DIR, "steamcmd.sh" if os.name == 'posix' else "steamcmd.exe")
+
 # Set up logging
-logging.basicConfig(filename='steamcmd_downloader.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(
+    filename=os.path.join(BASE_DIR, 'steamcmd_downloader.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
+
+# Create directories at startup
+def ensure_directories():
+    """Ensure all required directories exist."""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(STEAMCMD_DIR, exist_ok=True)
+    logging.info(f"Directories ensured: {DOWNLOAD_DIR}, {STEAMCMD_DIR}")
 
 # Step 1: Environment & System Check
 def check_steamcmd():
@@ -26,21 +57,29 @@ def check_steamcmd():
 
 def install_steamcmd():
     """Install SteamCMD if missing."""
-    if os.name == 'posix':  # Linux (Railway default)
-        os.makedirs("./steamcmd", exist_ok=True)
-        subprocess.run("wget https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz -O steamcmd.tar.gz", shell=True)
-        subprocess.run("tar -xvzf steamcmd.tar.gz -C ./steamcmd", shell=True)
-        os.remove("steamcmd.tar.gz")
-    elif os.name == 'nt':  # Windows (for local testing)
-        # Note: Railway uses Linux, so this is optional
-        subprocess.run("curl -o steamcmd.zip https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip", shell=True)
-        subprocess.run("unzip steamcmd.zip -d ./steamcmd", shell=True)
-        os.remove("steamcmd.zip")
-    logging.info("SteamCMD installed successfully")
-    return "SteamCMD installed. Please refresh the page."
+    try:
+        ensure_directories()
+        
+        if os.name == 'posix':  # Linux (Railway default)
+            subprocess.run("wget https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz -O steamcmd.tar.gz", shell=True, check=True)
+            subprocess.run(f"tar -xvzf steamcmd.tar.gz -C {STEAMCMD_DIR}", shell=True, check=True)
+            os.remove("steamcmd.tar.gz")
+        elif os.name == 'nt':  # Windows (for local testing)
+            subprocess.run("curl -o steamcmd.zip https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip", shell=True, check=True)
+            subprocess.run(f"unzip steamcmd.zip -d {STEAMCMD_DIR}", shell=True, check=True)
+            os.remove("steamcmd.zip")
+        
+        logging.info("SteamCMD installed successfully")
+        return "SteamCMD installed successfully. Please refresh the page."
+    except Exception as e:
+        logging.error(f"SteamCMD installation failed: {str(e)}")
+        return f"Installation failed: {str(e)}"
 
 def extract_game_id(input_str):
     """Extract game ID from URL or direct input."""
+    if not input_str:
+        return None
+        
     if input_str.startswith("http"):
         match = re.search(r'store\.steampowered\.com/app/(\d+)', input_str)
         return match.group(1) if match else None
@@ -60,16 +99,35 @@ def validate_login(username, password, anonymous, game_id):
 
 # Step 4 & 5: Download Management & Real-Time Progress
 def parse_progress(output):
-    """Parse SteamCMD output for progress or errors."""
-    if "Login Failure" in output:
-        return "Authentication failed"
+    """Improved progress parsing with better error detection."""
+    if "Login Failure" in output or "Invalid Password" in output:
+        return "Authentication failed: Invalid username or password"
     elif "Invalid App ID" in output:
         return "Invalid game ID"
+    elif "No space left on device" in output:
+        return "Error: Insufficient disk space"
     elif "ERROR" in output:
+        # Extract specific error message
+        error_match = re.search(r'ERROR\s*:\s*(.+)$', output, re.MULTILINE)
+        if error_match:
+            return f"Error: {error_match.group(1)}"
         return "Download error occurred"
-    match = re.search(r'Progress: (\d+\.\d+)%', output) or re.search(r'(\d+\.\d+)%', output)
-    if match:
-        return float(match.group(1))
+        
+    # Try multiple progress patterns
+    patterns = [
+        r'Progress: (\d+\.\d+)%',
+        r'(\d+\.\d+)% complete',
+        r'(\d+)% \(\d+/\d+\)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, output)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+                
     return None
 
 def start_download(game_id, username, password, anonymous):
@@ -80,7 +138,7 @@ def start_download(game_id, username, password, anonymous):
         yield gr.update(value=0), "", "", "", message, ""
         return
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    ensure_directories()  # Make sure directories exist
     login_cmd = "+login anonymous" if anonymous else f"+login {username} {password}"
     cmd = f"{STEAMCMD_PATH} {login_cmd} +force_install_dir {DOWNLOAD_DIR} +app_update {game_id} validate +quit"
 
@@ -105,10 +163,20 @@ def start_download(game_id, username, password, anonymous):
     
     # Download completed
     elapsed = f"{time.time() - start_time:.2f} s"
-    files = [f for f in os.listdir(DOWNLOAD_DIR) if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))]
-    links = [f"{PUBLIC_URL}/file/{os.path.join(DOWNLOAD_DIR, f)}" for f in files] if files else ["No files downloaded"]
-    logging.info(f"Download completed for game {game_id}: {files}")
-    yield gr.update(value=100), elapsed, "0 s", "N/A", "Download completed", "\n".join(links)
+    
+    # Get all files in the download directory recursively
+    file_paths = []
+    for root, _, files in os.walk(DOWNLOAD_DIR):
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, DOWNLOAD_DIR)
+            file_paths.append(rel_path)
+    
+    # Create download links
+    links = [f"{PUBLIC_URL}/downloads/{file}" for file in file_paths] if file_paths else ["No files downloaded"]
+    
+    logging.info(f"Download completed for game {game_id}: {len(file_paths)} files")
+    yield gr.update(value=100), elapsed, "0 s", "N/A", "Download completed", "\n".join(links[:20]) + ("\n...\n(more files available)" if len(links) > 20 else "")
 
 # Step 2: Gradio Interface Setup
 def create_interface():
@@ -116,33 +184,63 @@ def create_interface():
         gr.Markdown("# SteamCMD Downloader")
         
         # System Check
-        if not check_steamcmd():
+        steamcmd_status = gr.Markdown("Checking SteamCMD status...")
+        
+        # Installation section
+        with gr.Row(visible=not check_steamcmd()) as install_row:
             gr.Markdown("SteamCMD not found.")
             install_btn = gr.Button("Install SteamCMD")
             install_output = gr.Textbox(label="Installation Status")
-            install_btn.click(install_steamcmd, outputs=install_output)
-        else:
-            gr.Markdown("SteamCMD is installed.")
-
-        # Login Form
-        with gr.Row():
-            username = gr.Textbox(label="Username")
-            password = gr.Textbox(label="Password", type="password")
-            anonymous = gr.Checkbox(label="Login Anonymously (for free games)")
         
-        # Game Input
-        game_id = gr.Textbox(label="Game ID or URL")
-        download_btn = gr.Button("Download")
+        # Login Form
+        with gr.Group():
+            gr.Markdown("## Game Selection")
+            anonymous = gr.Checkbox(label="Login Anonymously (for free games)", value=True)
+            
+            with gr.Row(visible=lambda: not anonymous.value):
+                username = gr.Textbox(label="Username")
+                password = gr.Textbox(label="Password", type="password")
+                
+            gr.Markdown("⚠️ Warning: Credentials are transmitted to the server. Use anonymous login when possible.")
+            
+            # Game Input
+            game_id = gr.Textbox(label="Game ID or Steam Store URL")
+            game_id_info = gr.Markdown("Example: 570 (for Dota 2) or https://store.steampowered.com/app/570/Dota_2/")
+            download_btn = gr.Button("Download Game")
 
         # Progress Display
-        progress_bar = gr.Slider(0, 100, label="Download Progress", interactive=False)
-        elapsed_time = gr.Textbox(label="Elapsed Time", interactive=False)
-        remaining_time = gr.Textbox(label="Remaining Time", interactive=False)
-        file_size = gr.Textbox(label="File Size", interactive=False)
-        status = gr.Textbox(label="Status", interactive=False)
-        links = gr.Textbox(label="Public Links", interactive=False)
+        with gr.Group():
+            gr.Markdown("## Download Status")
+            progress_bar = gr.Slider(0, 100, label="Download Progress", interactive=False)
+            
+            with gr.Row():
+                elapsed_time = gr.Textbox(label="Elapsed Time", interactive=False)
+                remaining_time = gr.Textbox(label="Remaining Time", interactive=False)
+                file_size = gr.Textbox(label="File Size", interactive=False)
+                
+            status = gr.Textbox(label="Status", interactive=False)
+            links = gr.Textbox(label="Download Links", interactive=False)
 
-        # Event Handler
+        # Set initial status
+        if check_steamcmd():
+            steamcmd_status.value = "✅ SteamCMD is installed and ready to use."
+            install_row.visible = False
+        else:
+            steamcmd_status.value = "❌ SteamCMD is not installed."
+            install_row.visible = True
+
+        # Event Handlers
+        install_btn.click(
+            install_steamcmd,
+            outputs=[install_output]
+        )
+        
+        anonymous.change(
+            lambda x: (not x, not x),
+            inputs=[anonymous],
+            outputs=[username, password]
+        )
+        
         download_btn.click(
             start_download,
             inputs=[game_id, username, password, anonymous],
@@ -151,16 +249,40 @@ def create_interface():
     
     return app
 
-# Deployment Setup for Railway
+# FastAPI setup
+app_fastapi = FastAPI(title="SteamCMD Downloader")
+
+# Initialize and mount Gradio app
+app_gradio = create_interface()
+
+# Mount static file directory for downloads
+@app_fastapi.on_event("startup")
+async def startup_event():
+    ensure_directories()
+    app_fastapi.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
+
+# Add file serving endpoint
+@app_fastapi.get("/file/{file_path:path}")
+async def serve_file(file_path: str):
+    full_path = os.path.abspath(file_path)
+    # Security check - ensure the path is within the allowed directories
+    if os.path.commonpath([full_path, DOWNLOAD_DIR]) != DOWNLOAD_DIR:
+        return {"error": "Access denied"}
+    return FileResponse(full_path)
+
+# Mount Gradio app
+app_fastapi.mount("/", gr.routes.App.create_app(app_gradio))
+
+# Deployment Setup
 if __name__ == "__main__":
     # In development, use ngrok for public URL; on Railway, use assigned domain
-    if os.environ.get("RAILWAY_ENVIRONMENT") is None:  # Local testing
+    if not IS_RAILWAY:
+        # Local testing with ngrok
         public_url = ngrok.connect(PORT).public_url
         logging.info(f"Local public URL: {public_url}")
         PUBLIC_URL = public_url
-    else:  # Railway deployment
-        PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_DOMAIN", f"http://0.0.0.0:{PORT}")
+    else:
         logging.info(f"Railway public URL: {PUBLIC_URL}")
 
-    app = create_interface()
-    app.launch(server_name="0.0.0.0", server_port=PORT)
+    import uvicorn
+    uvicorn.run(app_fastapi, host="0.0.0.0", port=PORT)
